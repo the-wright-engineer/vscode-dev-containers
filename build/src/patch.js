@@ -87,6 +87,75 @@ function updateVersionTag(fullTag, registryPath) {
     return tag;
 }
 
+async function deleteUnpatchedImages(patchPath, registry, registryPath) {
+    
+    patchPath = path.resolve(patchPath);
+    const patchConfigFilePath = path.resolve(patchPath, 'patch.json');
+    const patchConfig = require(patchConfigFilePath);
+
+    if(!patchConfig.imageIds) {
+        console.log('(!) Patch does not include image IDs.  Nothing to do.');
+        return;
+    }
+
+    // ACR registry name is the registry minus .azurecr.io
+    const registryName = registry.replace('.azurecr.io', '');
+
+    console.log(`(*) Deleting untagged images for patch located at "${patchPath}"...`);
+    const manifests = getImageManifests(registry, patchConfig.imageIds);
+
+    const spawnOpts = { stdio: 'inherit', cwd: patchPath,  shell: true };
+    await asyncUtils.forEach(manifests, async (manifest) => {
+        if(manifest.tags.length > 0) {
+            console.log(`(!) Skipping ${manifest.digest} because it has tags.`);
+            return;
+        }
+        const fullImageId = `${manifest.repository}@${manifest.digest}`;
+        console.log(`(*) Deleting ${fullImageId}...`);
+        // Pull and build patched tag
+        await asyncUtils.spawn('az', [
+                'acr',
+                'repository',
+                'delete',
+                '--name', registryName,
+                '--image', fullImageId
+            ], spawnOpts);
+    });
+
+    console.log('\n(*) Done!')
+
+}
+
+async function getImageManifests(registryName, imageIds) {
+    let manifests = [];
+
+    // Get list of repositories
+    console.log(`(*) Getting repository list for ACR "${registryName}"...`)
+    const repositoryListOutput = await asyncUtils.spawn('az',
+        ['acr', 'repository', 'list', '--name', registryName],
+        { shell: true, stdio: 'pipe' });
+    const repositoryList = JSON.parse(repositoryListOutput);
+
+    // Query each repository for images, then add any tags found to the list
+    const query = imageIds.reduce((prev, current) => {
+                return prev ?  `${prev} || digest=='${current}'` : `"[?digest=='${current}'`;
+        }, null) + '].tags | []"';
+    await asyncUtils.forEach(repositoryList, async (repository) => {
+        console.log(`(*) Getting manifests from "${repository}"...`);
+        const registryManifestListOutput = await asyncUtils.spawn('az',
+            ['acr', 'repository', 'show-manifests', '--name', registryName, '--repository', repository, "--query", query],
+            { shell: true, stdio: 'pipe' });
+        let registryManifestList = JSON.parse(registryManifestListOutput);
+        registryManifestList = registryManifestList.map((manifest) => {
+            manifest.repository = repository;
+            return manifest;
+        });
+        manifests = manifests.concat(registryManifestList);
+    });
+
+    return manifests;
+}
+
 module.exports = {
     patch: patch
 }
